@@ -294,7 +294,9 @@ class Shift:
     intervals: list[Interval] = field(default_factory=list)
     gaps: list[Gap] = field(default_factory=list)
     orphan_exit: Event | None = None
+    open_entry: Event | None = None
     incomplete_arrival: bool = False
+    incomplete_departure: bool = False
     first_entry: datetime | None = None
     last_exit: datetime | None = None
     workplace: timedelta = timedelta(0)
@@ -341,12 +343,17 @@ class Shift:
 
     @property
     def full_workplace(self) -> bool:
-        return not self.incomplete_arrival and self.first_entry is not None
+        return (
+            not self.incomplete_arrival
+            and not self.incomplete_departure
+            and self.first_entry is not None
+            and self.last_exit is not None
+        )
 
 
-def parse_events() -> list[Event]:
+def parse_events(raw: str) -> list[Event]:
     events: list[Event] = []
-    for line in RAW.strip().splitlines():
+    for line in raw.strip().splitlines():
         time_s, date_s, name, source = [p.strip() for p in line.split("\t")]
         dt = datetime.strptime(f"{date_s} {time_s}", "%d.%m.%Y %H:%M:%S")
         if source == "Дверь в чистую зону" and "выход" in name:
@@ -363,8 +370,8 @@ def parse_events() -> list[Event]:
             raise ValueError(f"Неизвестное событие: {name} / {source}")
         events.append(Event(dt, name, source, kind))
     events.sort(key=lambda e: e.dt)
-    if len(events) != 152:
-        raise AssertionError(f"Ожидалось 152 события, получено {len(events)}")
+    if not events:
+        raise AssertionError("В журнале нет событий")
     for prev, cur in zip(events, events[1:]):
         if cur.dt <= prev.dt:
             raise AssertionError(f"Нарушен порядок времени: {prev.dt} >= {cur.dt}")
@@ -408,23 +415,41 @@ def group_shifts(events: list[Event]) -> list[Shift]:
             shifts.append(current)
             current = None
     if current is not None:
-        raise AssertionError("Последняя смена не закрыта выходом с территории")
+        # Журнал оборвался: смена начата, выхода с территории нет.
+        shifts.append(current)
     if getattr(group_shifts, "_pending", []):
         raise AssertionError("Осталась непривязанная аномалия турникета")
-    if len(shifts) != 15:
-        raise AssertionError(f"Ожидалось 15 смен, получено {len(shifts)}")
+    if not shifts:
+        raise AssertionError("Не удалось собрать ни одной смены")
     return shifts
 
 
+def _at(moment: datetime, hour: int) -> datetime:
+    return moment.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+
 def classify(shift: Shift) -> None:
-    anchor = shift.gate_out.dt if shift.gate_out else shift.events[-1].dt
-    if anchor.hour <= 10:
-        shift.night = True
-        shift.end = anchor.replace(hour=9, minute=0, second=0, microsecond=0)
-    elif anchor.hour >= 21:
+    entered = shift.gate_in.dt if shift.gate_in else None
+    left = shift.gate_out.dt if shift.gate_out else None
+    # Дневная смена, с которой ушли задолго до 21:00: вход и выход в одно утро.
+    # Иначе утренний выход был бы принят за конец ночной смены.
+    if entered and left and entered.date() == left.date() and entered.hour < 14:
         shift.night = False
-        shift.end = anchor.replace(hour=21, minute=0, second=0, microsecond=0)
+        shift.end = _at(entered, 21)
+    elif left and left.hour < 14:
+        shift.night = True
+        shift.end = _at(left, 9)
+    elif left and left.hour >= 18:
+        shift.night = False
+        shift.end = _at(left, 21)
+    elif entered and left is None and entered.hour >= 18:
+        shift.night = True
+        shift.end = _at(entered + timedelta(days=1), 9)
+    elif entered and left is None and entered.hour < 14:
+        shift.night = False
+        shift.end = _at(entered, 21)
     else:
+        anchor = left or shift.events[-1].dt
         raise AssertionError(f"Неоднозначный конец смены: {anchor}")
     shift.start = shift.end - SHIFT_LEN
     if not (shift.start - timedelta(hours=2) <= shift.events[0].dt <= shift.end):
@@ -445,20 +470,31 @@ def pair_clean_zone(shift: Shift) -> None:
             raise AssertionError(f"{shift.label}: ожидался вход, получено {clean[idx]}")
         enter = clean[idx]
         idx += 1
-        if idx >= len(clean) or clean[idx].kind != "clean_out":
+        if idx >= len(clean):
+            if shift.gate_out is not None:
+                raise AssertionError(
+                    f"{shift.label}: вход {enter.dt} без выхода при уже закрытой территории"
+                )
+            shift.open_entry = enter
+            shift.incomplete_departure = True
+            break
+        if clean[idx].kind != "clean_out":
             raise AssertionError(f"{shift.label}: вход {enter.dt} без выхода")
         leave = clean[idx]
         if leave.dt <= enter.dt:
             raise AssertionError(f"{shift.label}: выход не позже входа")
         shift.intervals.append(Interval(enter.dt, leave.dt))
         idx += 1
-    if not shift.intervals and shift.orphan_exit is None:
-        raise AssertionError(f"{shift.label}: нет событий чистой зоны")
     if shift.intervals:
         shift.first_entry = shift.intervals[0].enter
-        shift.last_exit = shift.intervals[-1].leave
+        if not shift.incomplete_departure:
+            shift.last_exit = shift.intervals[-1].leave
+    elif shift.open_entry:
+        shift.first_entry = shift.open_entry.dt
     elif shift.orphan_exit:
         shift.last_exit = shift.orphan_exit.dt
+    else:
+        raise AssertionError(f"{shift.label}: нет событий чистой зоны")
 
 
 def measure(shift: Shift) -> None:
@@ -506,6 +542,8 @@ def measure(shift: Shift) -> None:
         )
     for left, right in zip(shift.intervals, shift.intervals[1:]):
         shift.gaps.append(Gap(left.leave, right.enter, "absence"))
+    if shift.open_entry and shift.intervals:
+        shift.gaps.append(Gap(shift.intervals[-1].leave, shift.open_entry.dt, "absence"))
     if shift.lateness and shift.lateness > timedelta(0) and shift.first_entry:
         shift.gaps.append(Gap(shift.start, shift.first_entry, "late"))
     if shift.early and shift.early > timedelta(0) and shift.last_exit:
@@ -552,13 +590,21 @@ def measure(shift: Shift) -> None:
 
 def explain(shift: Shift) -> None:
     parts: list[str] = []
-    assert shift.start and shift.end and shift.last_exit
+    assert shift.start and shift.end
 
     if shift.incomplete_arrival:
         parts.append(
             "В журнале только окончание ночной смены: нет входа через турникет и неизвестно, "
             f"когда сотрудник впервые зашёл в чистую зону. Время на рабочем месте до выхода "
             f"в {clock(shift.orphan_exit.dt)} не посчитано."
+        )
+
+    if shift.incomplete_departure and shift.open_entry:
+        parts.append(
+            f"Журнал обрывается на входе в чистую зону "
+            f"{shift.open_entry.dt:%d.%m.%Y} в {clock(shift.open_entry.dt)}. "
+            "Выхода из чистой зоны и выхода с территории дальше нет, поэтому время ухода неизвестно. "
+            "В строке посчитаны только закрытые интервалы до этого входа. В общий итог смена не входит."
         )
 
     if shift.opened_without_gate and not shift.incomplete_arrival:
@@ -622,12 +668,18 @@ def explain(shift: Shift) -> None:
             f"раньше {shift.end:%H:%M}. Это меньше одной минуты и как нарушение не выделено."
         )
 
-    if shift.significant_late or shift.significant_early or shift.incomplete_arrival or shift.anomalies or shift.minor_early or (shift.opened_without_gate and not shift.incomplete_arrival):
-        shift.explanation = " ".join(parts)
-    else:
-        shift.explanation = "—"
+    notable = (
+        shift.significant_late
+        or shift.significant_early
+        or shift.incomplete_arrival
+        or shift.incomplete_departure
+        or shift.anomalies
+        or shift.minor_early
+        or (shift.opened_without_gate and not shift.incomplete_arrival)
+    )
+    shift.explanation = " ".join(parts) if notable else "—"
 
-    if shift.incomplete_arrival:
+    if shift.incomplete_arrival or shift.incomplete_departure:
         shift.status = "Неполные данные"
     elif shift.significant_late and shift.significant_early:
         shift.status = "Опоздание и ранний уход"
@@ -639,22 +691,26 @@ def explain(shift: Shift) -> None:
         shift.status = "Норма"
 
 
-def analyze() -> list[Shift]:
+def analyze(raw: str) -> list[Shift]:
     group_shifts._pending = []  # type: ignore[attr-defined]
-    events = parse_events()
+    events = parse_events(raw)
     shifts = group_shifts(events)
     for shift in shifts:
         classify(shift)
         pair_clean_zone(shift)
         measure(shift)
         explain(shift)
-    # Контрольные значения, посчитанные вручную.
+    return shifts
+
+
+def verify_september(shifts: list[Shift]) -> None:
     by_start = {s.start: s for s in shifts}
     s05 = by_start[datetime(2026, 9, 5, 9, 0)]
     s13 = by_start[datetime(2026, 9, 13, 9, 0)]
     s0809 = by_start[datetime(2026, 9, 8, 21, 0)]
     s22 = by_start[datetime(2026, 9, 22, 9, 0)]
     s30 = by_start[datetime(2026, 9, 30, 9, 0)]
+    assert len(shifts) == 15
     assert secs(s05.workplace) == 10 * 3600 + 50 * 60 + 28, s05.workplace
     assert secs(s05.territory) == 12 * 3600 + 44 * 60 + 18, s05.territory
     assert secs(s05.early) == 2 * 60 + 11, s05.early
@@ -664,7 +720,15 @@ def analyze() -> list[Shift]:
     assert secs(s22.territory) == 12 * 3600 + 40 * 60 + 34, s22.territory
     assert len(s30.anomalies) == 1
     assert s30.anomalies[0].dt == datetime(2026, 9, 30, 8, 29, 40)
-    return shifts
+    full = [s for s in shifts if s.full_workplace]
+    workplace = sum((s.workplace for s in full), timedelta(0))
+    territory = sum((s.territory for s in full if s.territory), timedelta(0))
+    early = sum((s.early for s in full if s.significant_early), timedelta(0))
+    late = sum((s.lateness for s in full if s.significant_late), timedelta(0))
+    assert secs(workplace) == 153 * 3600 + 16 * 60 + 16, workplace
+    assert secs(territory) == 165 * 3600 + 18 * 60 + 28, territory
+    assert secs(early) == 51 * 60 + 29, early
+    assert secs(late) == 75, late
 
 
 # --- Excel ---
@@ -838,7 +902,7 @@ def build_shifts_sheet(wb: Workbook, shifts: list[Shift]) -> None:
         r = first + i
         values = [
             i + 1,
-            shift.label + (" *" if shift.incomplete_arrival else ""),
+            shift.label + (" *" if not shift.full_workplace else ""),
             shift.schedule,
             shift.gate_in.dt if shift.gate_in else None,
             shift.gate_out.dt if shift.gate_out else None,
@@ -895,6 +959,16 @@ def build_shifts_sheet(wb: Workbook, shifts: list[Shift]) -> None:
                 ws.cell(r, c).font = FONT_GRAY
             if ws.cell(r, 4).value is None:
                 ws.cell(r, 4).value = "нет в журнале"
+        if shift.gate_out is None:
+            ws.cell(r, 5).fill = FILL["gray"]
+            ws.cell(r, 5).font = FONT_GRAY
+            if ws.cell(r, 5).value is None:
+                ws.cell(r, 5).value = "нет в журнале"
+        if shift.last_exit is None:
+            ws.cell(r, 8).fill = FILL["gray"]
+            ws.cell(r, 8).font = FONT_GRAY
+            ws.cell(r, 8).value = "нет в журнале"
+            ws.cell(r, 10).fill = FILL["gray"]
 
         # Подсветка опоздания и раннего ухода
         if shift.significant_late:
@@ -926,7 +1000,13 @@ def build_shifts_sheet(wb: Workbook, shifts: list[Shift]) -> None:
 
         note = ws.cell(r, 20)
         if shift.explanation != "—":
-            if shift.significant_late or shift.significant_early or shift.incomplete_arrival or shift.anomalies:
+            if (
+                shift.significant_late
+                or shift.significant_early
+                or shift.incomplete_arrival
+                or shift.incomplete_departure
+                or shift.anomalies
+            ):
                 note.fill = FILL["note"]
                 note.font = FONT_BOLD
             else:
@@ -939,15 +1019,13 @@ def build_shifts_sheet(wb: Workbook, shifts: list[Shift]) -> None:
         ws.row_dimensions[r].height = 34 if text_len < 140 else 50 if text_len < 280 else 78
 
     last = first + len(shifts) - 1
-    if not shifts[0].incomplete_arrival:
-        raise AssertionError("Первая смена должна быть неполным фрагментом 31.08–01.09")
-    sum_from = first + 1
+    full_count = sum(1 for s in shifts if s.full_workplace)
     total_row = last + 2
     ws.cell(total_row, 1, "").fill = FILL["total"]
     label = ws.cell(
         total_row,
         2,
-        "Итого по 14 полным сменам. Фрагмент 31.08–01.09 в сумму не входит.",
+        f"Итого по {full_count} полным сменам. Строки «Неполные данные» в сумму не входят.",
     )
     label.font = FONT_BOLD
     label.alignment = LEFT
@@ -960,7 +1038,7 @@ def build_shifts_sheet(wb: Workbook, shifts: list[Shift]) -> None:
         cell = ws.cell(
             total_row,
             col,
-            f"=SUM({get_column_letter(col)}{sum_from}:{get_column_letter(col)}{last})",
+            f'=SUMIF($K${first}:$K${last},"<>Неполные данные",{get_column_letter(col)}{first}:{get_column_letter(col)}{last})',
         )
         cell.number_format = FMT_DUR
         cell.font = FONT_BOLD
@@ -968,7 +1046,7 @@ def build_shifts_sheet(wb: Workbook, shifts: list[Shift]) -> None:
         cell.fill = FILL["total"]
         cell.border = thin
     share = ws.cell(
-        total_row, 17, f"=AVERAGE({get_column_letter(17)}{sum_from}:{get_column_letter(17)}{last})"
+        total_row, 17, f"=AVERAGE({get_column_letter(17)}{first}:{get_column_letter(17)}{last})"
     )
     share.number_format = FMT_PCT
     share.font = FONT_BOLD
@@ -976,12 +1054,10 @@ def build_shifts_sheet(wb: Workbook, shifts: list[Shift]) -> None:
     share.fill = FILL["total"]
     share.border = thin
     ws.row_dimensions[total_row].height = 32
-    fragment = shifts[0]
     footnote = ws.cell(
         total_row + 1,
         2,
-        "Неполная ночь 31.08–01.09 в итог не включена: до выхода в 05:09:25 время неизвестно, "
-        f"после возвращения в 05:44:19 в чистой зоне ещё {fmt_ru(fragment.workplace)}. "
+        "Неполные смены в итог не включены: по ним не виден либо приход, либо уход. "
         "Сумма колонки «Ранний уход» включает и уходы короче одной минуты; "
         "как нарушение на листе «Итоги» посчитаны только уходы от 1 минуты.",
     )
@@ -992,7 +1068,7 @@ def build_shifts_sheet(wb: Workbook, shifts: list[Shift]) -> None:
 
     widths = {
         1: 5, 2: 34, 3: 34, 4: 22, 5: 22, 6: 18, 7: 24, 8: 24,
-        9: 14, 10: 14, 11: 20, 12: 20, 13: 18, 14: 16, 15: 18,
+        9: 14, 10: 16, 11: 28, 12: 20, 13: 18, 14: 16, 15: 18,
         16: 20, 17: 18, 18: 22, 19: 46, 20: 62,
     }
     for col, width in widths.items():
@@ -1165,7 +1241,9 @@ def build_intervals_sheet(wb: Workbook, shifts: list[Shift]) -> None:
                 notes.append("Первый вход до начала смены")
             elif is_first:
                 notes.append("Первый вход")
-            if is_last and shift.significant_early:
+            if is_last and shift.incomplete_departure:
+                notes.append("После этого снова вошёл в чистую зону, выход в журнал не попал")
+            elif is_last and shift.significant_early:
                 notes.append("Последний выход — ранний уход")
             elif is_last and shift.after > timedelta(0):
                 notes.append("Последний выход после конца смены")
@@ -1243,6 +1321,8 @@ def event_mark(shift: Shift, event: Event) -> str:
         return "Выход с территории"
     if event.kind == "wardrobe_in":
         return "Вход в гардероб (не рабочее место)"
+    if event.kind == "clean_in" and shift.open_entry and event.dt == shift.open_entry.dt:
+        return "Вход в чистую зону, дальше журнал обрывается"
     if event.kind == "clean_in" and shift.first_entry and event.dt == shift.first_entry:
         if shift.significant_late:
             return "Опоздание на рабочее место"
@@ -1307,6 +1387,10 @@ def build_journal_sheet(wb: Workbook, shifts: list[Shift]) -> None:
                 for c in range(1, 7):
                     ws.cell(row, c).fill = FILL["early"]
                 ws.cell(row, 6).font = FONT_EARLY
+            elif "журнал обрывается" in mark:
+                for c in range(1, 7):
+                    ws.cell(row, c).fill = FILL["gray"]
+                ws.cell(row, 6).font = FONT_GRAY
             elif "менее чем на минуту" in mark:
                 ws.cell(row, 6).fill = FILL["minor"]
                 ws.cell(row, 6).font = FONT_MINOR
@@ -1317,8 +1401,9 @@ def build_journal_sheet(wb: Workbook, shifts: list[Shift]) -> None:
             ws.row_dimensions[row].height = 18
             row += 1
     last = row - 1
-    if n != 152:
-        raise AssertionError(f"В журнале {n} строк вместо 152")
+    expected = sum(len(s.events) + len(s.anomalies) for s in shifts)
+    if n != expected:
+        raise AssertionError(f"В журнале {n} строк вместо {expected}")
     ws.auto_filter.ref = f"A1:F{last}"
     widths = {1: 6, 2: 22, 3: 32, 4: 32, 5: 36, 6: 68}
     for c, w in widths.items():
@@ -1365,11 +1450,68 @@ def build_chart_data(wb: Workbook, shifts: list[Shift]):
     return ws
 
 
-def build_summary(wb: Workbook, shifts: list[Shift], chart_ws) -> None:
+def format_date_ranges(days: list) -> str:
+    if not days:
+        return ""
+    ranges = []
+    start = prev = days[0]
+    for day in days[1:]:
+        if day == prev + timedelta(days=1):
+            prev = day
+            continue
+        ranges.append((start, prev))
+        start = prev = day
+    ranges.append((start, prev))
+    parts = []
+    for first, last in ranges:
+        if first == last:
+            parts.append(f"{first:%d.%m}")
+        else:
+            parts.append(f"{first:%d.%m}–{last:%d.%m}")
+    return ", ".join(parts)
+
+
+def silent_days_text(shifts: list[Shift]) -> str | None:
+    seen = set()
+    for shift in shifts:
+        for event in list(shift.events) + list(shift.anomalies):
+            seen.add(event.dt.date())
+    if not seen:
+        return None
+    day = min(seen)
+    last = max(seen)
+    missing = []
+    while day <= last:
+        if day not in seen:
+            missing.append(day)
+        day += timedelta(days=1)
+    if not missing:
+        return None
+    return (
+        "В выгрузке нет ни одного события за "
+        + format_date_ranges(missing)
+        + ". Это не записано как отсутствие: по этим датам журнал просто ничего не содержит."
+    )
+
+
+def caveat_rows(shifts: list[Shift]) -> list[tuple[str, str]]:
+    rows = []
+    for shift in shifts:
+        if shift.incomplete_arrival or shift.incomplete_departure or shift.anomalies or (
+            shift.opened_without_gate and shift.full_workplace
+        ):
+            rows.append((shift.label, shift.explanation))
+    silent = silent_days_text(shifts)
+    if silent:
+        rows.append(("Дни без записей", silent))
+    return rows
+
+
+def build_summary(wb: Workbook, shifts: list[Shift], chart_ws, period: str) -> None:
     ws = wb.create_sheet("Итоги", 0)
     full = [s for s in shifts if s.full_workplace]
     with_site = [s for s in full if s.territory is not None]
-    fragment = next(s for s in shifts if s.incomplete_arrival)
+    incomplete = [s for s in shifts if not s.full_workplace]
 
     workplace = sum((s.workplace for s in full), timedelta(0))
     workplace_in = sum((s.workplace_in for s in full), timedelta(0))
@@ -1394,7 +1536,7 @@ def build_summary(wb: Workbook, shifts: list[Shift], chart_ws) -> None:
     ws.merge_cells("B3:G3")
     sub = ws["B3"]
     sub.value = (
-        "Журнал СКУД за 31.08.2026–30.09.2026. Рабочее место — дверь в чистую зону. "
+        f"Журнал СКУД за {period}. Рабочее место — дверь в чистую зону. "
         "Территория — турникет на проходной. Смена длится 12 часов: с 09:00 до 21:00 или с 21:00 до 09:00."
     )
     sub.font = Font(name="Calibri", size=11, color="52606D")
@@ -1667,48 +1809,23 @@ def build_summary(wb: Workbook, shifts: list[Shift], chart_ws) -> None:
         row += 1
     dev_last = row - 1
 
-    row += 1
-    ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=7)
-    minor_text = "Меньше одной минуты раньше конца смены (не выделено как нарушение): " + "; ".join(
-        f"{s.label.split(' (')[0]} — {fmt_ru(s.early)} (выход в {clock(s.last_exit)})" for s in minor_shifts
-    )
-    ws.cell(row, 2, minor_text).font = FONT_MINOR
-    ws.cell(row, 2).fill = FILL["minor"]
-    ws.cell(row, 2).alignment = LEFT
-    for c in range(2, 8):
-        ws.cell(row, c).fill = FILL["minor"]
-    ws.row_dimensions[row].height = 36
-    minor_row = row
+    if minor_shifts:
+        row += 1
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=7)
+        minor_text = "Меньше одной минуты раньше конца смены (не выделено как нарушение): " + "; ".join(
+            f"{s.label.split(' (')[0]} — {fmt_ru(s.early)} (выход в {clock(s.last_exit)})" for s in minor_shifts
+        )
+        ws.cell(row, 2, minor_text).font = FONT_MINOR
+        ws.cell(row, 2).fill = FILL["minor"]
+        ws.cell(row, 2).alignment = LEFT
+        for c in range(2, 8):
+            ws.cell(row, c).fill = FILL["minor"]
+        ws.row_dimensions[row].height = 36
 
     row += 2
     section(row, "Неполные и спорные записи")
     row += 1
-    caveats = [
-        (
-            "Ночь 31.08–01.09",
-            "Журнал начинается уже с выхода из чистой зоны в 05:09:25. Сколько сотрудник провёл на рабочем месте "
-            f"до этого момента, неизвестно. После возвращения в 05:44:19 он был в чистой зоне ещё {fmt_ru(fragment.workplace)} "
-            f"и вышел в {clock(fragment.last_exit)} — на {fmt_ru(fragment.early)} раньше 09:00. "
-            "Этот фрагмент не входит в общий итог времени.",
-        ),
-        (
-            "Ночь 01.09–02.09",
-            "Время на рабочем месте посчитано полностью (вход в чистую зону в 20:45:29, выход в 08:54:35). "
-            "Фактического входа через турникет в журнале нет, есть только выход в 09:31:02, "
-            "поэтому время на территории за эту смену неизвестно и в итог территории не входит.",
-        ),
-        (
-            "Утро 30.09",
-            "В 08:29:40 турникет записал фактический выход, а в 08:29:48 — фактический вход. "
-            "Смена 29.09 уже была закрыта выходом в 21:01:09. Утренний «выход» не используется. "
-            "Время на территории 30.09 считается от входа в 08:29:48 до выхода в 21:06:07.",
-        ),
-        (
-            "Дни без записей",
-            "В выгрузке нет ни одного события за 03–04.09, 11–12.09, 15–21.09, 23.09 и 28.09, "
-            "а также за начало смены 31.08. Это не записано как отсутствие: по этим датам журнал просто ничего не содержит.",
-        ),
-    ]
+    caveats = caveat_rows(shifts)
     for title_text, body in caveats:
         ws.cell(row, 2, title_text).font = FONT_BOLD
         ws.cell(row, 2).alignment = LEFT
@@ -1722,12 +1839,17 @@ def build_summary(wb: Workbook, shifts: list[Shift], chart_ws) -> None:
         for c in range(3, 8):
             ws.cell(row, c).border = thin
             ws.cell(row, c).fill = FILL["white"]
-        ws.row_dimensions[row].height = 48
+        ws.row_dimensions[row].height = 36 if len(body) < 160 else 56 if len(body) < 320 else 78
         row += 1
 
     chart_row = row + 2
     ws.merge_cells(start_row=chart_row, start_column=2, end_row=chart_row, end_column=7)
-    cap = ws.cell(chart_row, 2, "Часы по сменам. Звёздочка у 31.08–01.09 — неполная смена, в общий итог не входит. Пустой столбец территории — нет входа через турникет.")
+    cap = ws.cell(
+        chart_row,
+        2,
+        "Часы по сменам. Звёздочка — неполная смена, в общий итог не входит. "
+        "Пустой столбец территории — нет входа или выхода через турникет.",
+    )
     cap.font = FONT_BOLD
     cap.alignment = LEFT
 
@@ -1756,8 +1878,8 @@ def build_summary(wb: Workbook, shifts: list[Shift], chart_ws) -> None:
         series.graphicalProperties.line.solidFill = color
     chart.y_axis.numFmt = "0"
     chart.x_axis.txPr = None
-    chart.width = 28
-    chart.height = 10
+    chart.width = 28 if len(shifts) <= 18 else 36
+    chart.height = 10 if len(shifts) <= 18 else 12
     ws.add_chart(chart, f"B{chart_row + 1}")
 
     # Ширины и оформление листа
@@ -1789,7 +1911,6 @@ def build_summary(wb: Workbook, shifts: list[Shift], chart_ws) -> None:
     ws.sheet_properties.tabColor = C_NAVY
 
     # Чтобы не ругался линтер на неиспользуемые локальные имена, если я их оставил.
-    _ = (check, dev_last, minor_row)
     return {
         "full": len(full),
         "with_site": len(with_site),
@@ -1806,7 +1927,7 @@ def build_summary(wb: Workbook, shifts: list[Shift], chart_ws) -> None:
         "early_n": len(early_shifts),
         "minor": minor_shifts,
         "share": share,
-        "fragment": fragment,
+        "incomplete": incomplete,
         "scheduled": scheduled,
         "all_early": all_early,
         "deviations": deviations,
@@ -1875,16 +1996,19 @@ def build_method(wb: Workbook) -> None:
             False,
         ),
         (
-            "Ночь 31.08–01.09 обрезана началом файла. Известен только кусок с 05:44:19 до 08:59:39 плюс сам факт, "
-            "что в 05:09:25 человек уже выходил из чистой зоны. Общий итог на этот кусок не опирается.",
+            "Если журнал начинается уже с выхода из чистой зоны или обрывается на входе без последующего выхода, "
+            "смена помечена как неполные данные и не входит в общий итог. Известный кусок остаётся в строке этой смены.",
             False,
         ),
         (
-            "Ночь 01.09–02.09 не имеет входа через турникет. В итог территории она не включена, в итог рабочего места включена.",
+            "Если нет фактического входа через турникет, время на территории не считается. "
+            "Выход через турникет за несколько секунд до входа, когда предыдущая смена уже закрыта, "
+            "не принимается за уход с территории.",
             False,
         ),
         (
-            "Событие 30.09 в 08:29:40 («фактический выход» за 8 секунд до входа) не принято за уход с территории.",
+            "Если сотрудник пришёл утром, как на дневную смену, но ушёл задолго до 21:00, "
+            "это всё равно дневная смена 09:00–21:00, а уход считается ранним.",
             False,
         ),
     ]
@@ -1938,33 +2062,50 @@ def print_report(shifts: list[Shift], summary: dict) -> None:
     print("До начала", fmt_ru(summary["before"]))
     print("После конца", fmt_ru(summary["after"]))
     print("Доля", f"{summary['share']:.1%}")
-    print("Фрагмент", fmt_ru(summary["fragment"].workplace))
+    for shift in summary["incomplete"]:
+        print("Неполная", shift.label, "РМ известно", fmt_ru(shift.workplace))
 
 
-def main() -> None:
-    shifts = analyze()
+def save_workbook(shifts: list[Shift], period: str, title: str, path: str) -> dict:
     wb = Workbook()
-    # Удаляем стандартный лист после того, как создадим свои: create_sheet и summary вставит Итоги на 0.
     default = wb.active
     chart_ws = build_chart_data(wb, shifts)
-    summary = build_summary(wb, shifts, chart_ws)
+    summary = build_summary(wb, shifts, chart_ws, period)
     build_shifts_sheet(wb, shifts)
     build_gaps_sheet(wb, shifts)
     build_intervals_sheet(wb, shifts)
     build_journal_sheet(wb, shifts)
     build_method(wb)
     wb.remove(default)
-    # Порядок: Итоги, Смены, Отлучки, Интервалы, Журнал, Методика. Данные графика скрыты.
     order = ["Итоги", "Смены", "Отлучки", "Интервалы", "Журнал", "Методика", "Данные графика"]
     for idx, name in enumerate(order):
         wb.move_sheet(name, offset=idx - wb.sheetnames.index(name))
-    wb.properties.title = "Нахождение на рабочем месте, сентябрь 2026"
+    wb.properties.title = title
     wb.properties.creator = "Анализ журнала СКУД"
     wb.properties.subject = "Рабочее место — чистая зона; территория — турникет"
-    path = "/workspace/analiz_rabochee_mesto_sentyabr_2026.xlsx"
     wb.save(path)
     print_report(shifts, summary)
     print("SAVED", path)
+    return summary
+
+
+def main() -> None:
+    september = analyze(RAW)
+    verify_september(september)
+    save_workbook(
+        september,
+        period="31.08.2026–30.09.2026",
+        title="Нахождение на рабочем месте, сентябрь 2026",
+        path="/workspace/analiz_rabochee_mesto_sentyabr_2026.xlsx",
+    )
+    july_raw = open("/workspace/data/iyul_avgust_2026.tsv", encoding="utf-8").read()
+    july = analyze(july_raw)
+    save_workbook(
+        july,
+        period="30.06.2026–31.08.2026",
+        title="Нахождение на рабочем месте, июль–август 2026",
+        path="/workspace/analiz_rabochee_mesto_iyul_avgust_2026.xlsx",
+    )
 
 
 if __name__ == "__main__":
